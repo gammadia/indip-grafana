@@ -473,6 +473,7 @@ require (
 	github.com/seatgeek/logrus-gelf-formatter v0.0.0-20210414080842-5b05eb8ff761 // indirect
 	github.com/sourcegraph/conc v0.3.0 // indirect
 	github.com/spf13/viper v1.19.0 // indirect
+	github.com/xwb1989/sqlparser v0.0.0-20180606152119-120387863bf2 // indirect
 	go.opentelemetry.io/contrib/propagators/b3 v1.28.0 // indirect
 	go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracehttp v1.28.0 // indirect
 	go.opentelemetry.io/otel/exporters/zipkin v1.28.0 // indirect
