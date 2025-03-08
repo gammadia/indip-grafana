@@ -1,24 +1,30 @@
-import React, { ReactNode } from 'react';
+import Map from 'ol/Map';
+import { Point } from 'ol/geom';
+import { VectorImage } from 'ol/layer';
+import LayerGroup from 'ol/layer/Group';
+import WebGLPointsLayer from 'ol/layer/WebGLPoints.js';
+import { ReactNode } from 'react';
+import { ReplaySubject } from 'rxjs';
+import tinycolor from 'tinycolor2';
+
 import {
   MapLayerRegistryItem,
   MapLayerOptions,
   PanelData,
   GrafanaTheme2,
   FrameGeometrySourceMode,
+  EventBus,
 } from '@grafana/data';
-import Map from 'ol/Map';
-import { FeatureLike } from 'ol/Feature';
-import { getLocationMatchers } from 'app/features/geo/utils/location';
-import { getScaledDimension, getColorDimension, getTextDimension, getScalarDimension } from 'app/features/dimensions';
-import { ObservablePropsWrapper } from '../../components/ObservablePropsWrapper';
-import { MarkersLegend, MarkersLegendProps } from './MarkersLegend';
-import { ReplaySubject } from 'rxjs';
-import { defaultStyleConfig, StyleConfig, StyleDimensions } from '../../style/types';
-import { StyleEditor } from './StyleEditor';
-import { getStyleConfigState } from '../../style/utils';
-import VectorLayer from 'ol/layer/Vector';
-import { isNumber } from 'lodash';
 import { FrameVectorSource } from 'app/features/geo/utils/frameVectorSource';
+import { getLocationMatchers } from 'app/features/geo/utils/location';
+
+import { MarkersLegend, MarkersLegendProps } from '../../components/MarkersLegend';
+import { ObservablePropsWrapper } from '../../components/ObservablePropsWrapper';
+import { StyleEditor } from '../../editor/StyleEditor';
+import { getWebGLStyle, textMarker } from '../../style/markers';
+import { DEFAULT_SIZE, defaultStyleConfig, StyleConfig } from '../../style/types';
+import { getDisplacement, getRGBValues, getStyleConfigState, styleUsesText } from '../../style/utils';
+import { getStyleDimension } from '../../utils/utils';
 
 // Configuration options for Circle overlays
 export interface MarkersConfig {
@@ -53,17 +59,33 @@ export const markersLayer: MapLayerRegistryItem<MarkersConfig> = {
   description: 'Use markers to render each data point',
   isBaseMap: false,
   showLocation: true,
+  hideOpacity: true,
 
   /**
    * Function that configures transformation and returns a transformer
+   * @param map
    * @param options
+   * @param theme
    */
-  create: async (map: Map, options: MapLayerOptions<MarkersConfig>, theme: GrafanaTheme2) => {
+  create: async (map: Map, options: MapLayerOptions<MarkersConfig>, eventBus: EventBus, theme: GrafanaTheme2) => {
     // Assert default values
     const config = {
       ...defaultOptions,
       ...options?.config,
     };
+
+    const style = await getStyleConfigState(config.style);
+    const symbol = config.style.symbol?.fixed;
+    const webGLStyle = await getWebGLStyle(symbol, config.style.opacity);
+    const hasText = styleUsesText(config.style);
+    const location = await getLocationMatchers(options.location);
+    const source = new FrameVectorSource<Point>(location);
+    const symbolLayer = new WebGLPointsLayer({ source, style: webGLStyle });
+    const textLayer = new VectorImage({ source, declutter: true });
+    const layers = new LayerGroup({
+      // If text and no symbol, only show text - fall back on default symbol
+      layers: hasText && symbol ? [symbolLayer, textLayer] : hasText && !symbol ? [textLayer] : [symbolLayer],
+    });
 
     const legendProps = new ReplaySubject<MarkersLegendProps>(1);
     let legend: ReactNode = null;
@@ -71,44 +93,8 @@ export const markersLayer: MapLayerRegistryItem<MarkersConfig> = {
       legend = <ObservablePropsWrapper watch={legendProps} initialSubProps={{}} child={MarkersLegend} />;
     }
 
-    const style = await getStyleConfigState(config.style);
-    const location = await getLocationMatchers(options.location);
-    const source = new FrameVectorSource(location);
-    const vectorLayer = new VectorLayer({
-      source,
-    });
-
-    if (!style.fields) {
-      // Set a global style
-      vectorLayer.setStyle(style.maker(style.base));
-    } else {
-      vectorLayer.setStyle((feature: FeatureLike) => {
-        const idx = feature.get('rowIndex') as number;
-        const dims = style.dims;
-        if (!dims || !isNumber(idx)) {
-          return style.maker(style.base);
-        }
-
-        const values = { ...style.base };
-
-        if (dims.color) {
-          values.color = dims.color.get(idx);
-        }
-        if (dims.size) {
-          values.size = dims.size.get(idx);
-        }
-        if (dims.text) {
-          values.text = dims.text.get(idx);
-        }
-        if (dims.rotation) {
-          values.rotation = dims.rotation.get(idx);
-        }
-        return style.maker(values);
-      });
-    }
-
     return {
-      init: () => vectorLayer,
+      init: () => layers,
       legend: legend,
       update: (data: PanelData) => {
         if (!data.series?.length) {
@@ -117,32 +103,58 @@ export const markersLayer: MapLayerRegistryItem<MarkersConfig> = {
         }
 
         for (const frame of data.series) {
-          if (style.fields) {
-            const dims: StyleDimensions = {};
-            if (style.fields.color) {
-              dims.color = getColorDimension(frame, style.config.color ?? defaultStyleConfig.color, theme);
-            }
-            if (style.fields.size) {
-              dims.size = getScaledDimension(frame, style.config.size ?? defaultStyleConfig.size);
-            }
-            if (style.fields.text) {
-              dims.text = getTextDimension(frame, style.config.text!);
-            }
-            if (style.fields.rotation) {
-              dims.rotation = getScalarDimension(frame, style.config.rotation ?? defaultStyleConfig.rotation);
-            }
-            style.dims = dims;
-          }
+          style.dims = getStyleDimension(frame, style, theme);
 
           // Post updates to the legend component
           if (legend) {
             legendProps.next({
-              color: style.dims?.color,
+              styleConfig: style,
               size: style.dims?.size,
+              layerName: options.name,
+              layer: symbolLayer,
             });
           }
 
           source.update(frame);
+          source.forEachFeature((feature) => {
+            const idx: number = feature.get('rowIndex');
+            const dims = style.dims;
+            const values = { ...style.base };
+
+            if (dims?.color) {
+              values.color = dims.color.get(idx);
+            }
+            if (dims?.size) {
+              values.size = dims.size.get(idx);
+            }
+            if (dims?.text) {
+              values.text = dims.text.get(idx);
+            }
+            if (dims?.rotation) {
+              values.rotation = dims.rotation.get(idx);
+            }
+            const colorString = tinycolor(theme.visualization.getColorByName(values.color)).toString();
+            const colorValues = getRGBValues(colorString);
+
+            const radius = values.size ?? DEFAULT_SIZE;
+            const displacement = getDisplacement(values.symbolAlign ?? defaultStyleConfig.symbolAlign, radius);
+
+            // WebGLPointsLayer uses style expressions instead of style functions
+            feature.setProperties({ red: colorValues?.r ?? 255 });
+            feature.setProperties({ green: colorValues?.g ?? 255 });
+            feature.setProperties({ blue: colorValues?.b ?? 255 });
+            feature.setProperties({ size: (values.size ?? 1) * 2 }); // TODO unify sizing across all source types
+            feature.setProperties({ rotation: ((values.rotation ?? 0) * Math.PI) / 180 });
+            feature.setProperties({ opacity: (values.opacity ?? 1) * (colorValues?.a ?? 1) });
+            feature.setProperties({ offsetX: displacement[0] });
+            feature.setProperties({ offsetY: displacement[1] });
+
+            // Set style to be used by VectorLayer (text only)
+            if (hasText) {
+              const textStyle = textMarker(values);
+              feature.setStyle(textStyle);
+            }
+          });
           break; // Only the first frame for now!
         }
       },

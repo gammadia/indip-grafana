@@ -1,9 +1,13 @@
 import { Fill, RegularShape, Stroke, Circle, Style, Icon, Text } from 'ol/style';
-import { Registry, RegistryItem } from '@grafana/data';
-import { defaultStyleConfig, DEFAULT_SIZE, StyleConfigValues, StyleMaker } from './types';
-import { getPublicOrAbsoluteUrl } from 'app/features/dimensions';
+import { LiteralStyle } from 'ol/style/literal';
 import tinycolor from 'tinycolor2';
+
+import { Registry, RegistryItem, textUtil } from '@grafana/data';
 import { config } from '@grafana/runtime';
+import { getPublicOrAbsoluteUrl } from 'app/features/dimensions';
+
+import { defaultStyleConfig, DEFAULT_SIZE, StyleConfigValues, StyleMaker } from './types';
+import { getDisplacement } from './utils';
 
 interface SymbolMaker extends RegistryItem {
   aliasIds: string[];
@@ -28,6 +32,12 @@ const MarkerShapePath = {
   x: 'img/icons/marker/x-mark.svg',
 };
 
+const WebGLRegularShapes: Record<string, string> = {
+  circle: 'img/icons/marker/circle.svg',
+  square: 'img/icons/marker/square.svg',
+  triangle: 'img/icons/marker/triangle.svg',
+};
+
 export function getFillColor(cfg: StyleConfigValues) {
   const opacity = cfg.opacity == null ? 0.8 : cfg.opacity;
   if (opacity === 1) {
@@ -36,6 +46,18 @@ export function getFillColor(cfg: StyleConfigValues) {
   if (opacity > 0) {
     const color = tinycolor(cfg.color).setAlpha(opacity).toRgbString();
     return new Fill({ color });
+  }
+  return undefined;
+}
+
+export function getStrokeStyle(cfg: StyleConfigValues) {
+  const opacity = cfg.opacity == null ? 0.8 : cfg.opacity;
+  if (opacity === 1) {
+    return new Stroke({ color: cfg.color, width: cfg.lineWidth ?? 1 });
+  }
+  if (opacity > 0) {
+    const color = tinycolor(cfg.color).setAlpha(opacity).toRgbString();
+    return new Stroke({ color, width: cfg.lineWidth ?? 1 });
   }
   return undefined;
 }
@@ -66,11 +88,13 @@ export const textMarker = (cfg: StyleConfigValues) => {
 
 export const circleMarker = (cfg: StyleConfigValues) => {
   const stroke = new Stroke({ color: cfg.color, width: cfg.lineWidth ?? 1 });
+  const radius = cfg.size ?? DEFAULT_SIZE;
   return new Style({
     image: new Circle({
       stroke,
       fill: getFillColor(cfg),
-      radius: cfg.size ?? DEFAULT_SIZE,
+      radius,
+      displacement: getDisplacement(cfg.symbolAlign ?? defaultStyleConfig.symbolAlign, radius),
     }),
     text: textLabel(cfg),
     stroke, // in case lines are sent to the markers layer
@@ -82,6 +106,14 @@ export const polyStyle = (cfg: StyleConfigValues) => {
   return new Style({
     fill: getFillColor(cfg),
     stroke: new Stroke({ color: cfg.color, width: cfg.lineWidth ?? 1 }),
+    text: textLabel(cfg),
+  });
+};
+
+export const routeStyle = (cfg: StyleConfigValues) => {
+  return new Style({
+    fill: getFillColor(cfg),
+    stroke: getStrokeStyle(cfg),
     text: textLabel(cfg),
   });
 };
@@ -131,7 +163,9 @@ const makers: SymbolMaker[] = [
           fill: getFillColor(cfg),
           points: 4,
           radius,
-          rotation: (rotation * Math.PI) / 180 + Math.PI / 4,
+          angle: Math.PI / 4,
+          rotation: (rotation * Math.PI) / 180,
+          displacement: getDisplacement(cfg.symbolAlign ?? defaultStyleConfig.symbolAlign, radius),
         }),
         text: textLabel(cfg),
       });
@@ -152,6 +186,7 @@ const makers: SymbolMaker[] = [
           radius,
           rotation: (rotation * Math.PI) / 180,
           angle: 0,
+          displacement: getDisplacement(cfg.symbolAlign ?? defaultStyleConfig.symbolAlign, radius),
         }),
         text: textLabel(cfg),
       });
@@ -173,6 +208,7 @@ const makers: SymbolMaker[] = [
           radius2: radius * 0.4,
           angle: 0,
           rotation: (rotation * Math.PI) / 180,
+          displacement: getDisplacement(cfg.symbolAlign ?? defaultStyleConfig.symbolAlign, radius),
         }),
         text: textLabel(cfg),
       });
@@ -193,6 +229,7 @@ const makers: SymbolMaker[] = [
           radius2: 0,
           angle: 0,
           rotation: (rotation * Math.PI) / 180,
+          displacement: getDisplacement(cfg.symbolAlign ?? defaultStyleConfig.symbolAlign, radius),
         }),
         text: textLabel(cfg),
       });
@@ -211,7 +248,9 @@ const makers: SymbolMaker[] = [
           points: 4,
           radius,
           radius2: 0,
-          rotation: (rotation * Math.PI) / 180 + Math.PI / 4,
+          angle: Math.PI / 4,
+          rotation: (rotation * Math.PI) / 180,
+          displacement: getDisplacement(cfg.symbolAlign ?? defaultStyleConfig.symbolAlign, radius),
         }),
         text: textLabel(cfg),
       });
@@ -219,12 +258,14 @@ const makers: SymbolMaker[] = [
   },
 ];
 
-async function prepareSVG(url: string, size?: number): Promise<string> {
+async function prepareSVG(url: string, size?: number, backgroundOpacity?: number): Promise<string> {
   return fetch(url, { method: 'GET' })
     .then((res) => {
       return res.text();
     })
     .then((text) => {
+      text = textUtil.sanitizeSVGContent(text);
+
       const parser = new DOMParser();
       const doc = parser.parseFromString(text, 'image/svg+xml');
       const svg = doc.getElementsByTagName('svg')[0];
@@ -240,12 +281,29 @@ async function prepareSVG(url: string, size?: number): Promise<string> {
       svg.setAttribute('fill', '#fff');
       svg.setAttribute('width', `${width}px`);
       svg.setAttribute('height', `${height}px`);
+
+      // add a mostly transparent circle behind the icon for webGL hit detection
+      // TODO open layers discards fully transparent elements for hit detection
+      if (backgroundOpacity) {
+        const viewBox = svg.getAttribute('viewBox')?.split(' ') ?? [0, 0, width, height];
+        const viewCenterX = Number(viewBox[2]) / 2;
+        const viewCenterY = Number(viewBox[3]) / 2;
+        const circleElement = doc.createElementNS('http://www.w3.org/2000/svg', 'circle');
+        circleElement.setAttribute('cx', viewCenterX.toString());
+        circleElement.setAttribute('cy', viewCenterY.toString());
+        circleElement.setAttribute('fill', 'none');
+        circleElement.setAttribute('r', (viewCenterX / 2).toString());
+        circleElement.setAttribute('stroke', `rgba(255,255,255,${backgroundOpacity})`);
+        circleElement.setAttribute('stroke-width', viewCenterX.toString());
+        svg.prepend(circleElement);
+      }
+
       const svgString = new XMLSerializer().serializeToString(svg);
       const svgURI = encodeURIComponent(svgString);
       return `data:image/svg+xml,${svgURI}`;
     })
     .catch((error) => {
-      console.error(error);
+      console.error(error); // eslint-disable-line no-console
       return '';
     });
 }
@@ -259,6 +317,36 @@ export function getMarkerAsPath(shape?: string): string | undefined {
     return marker.aliasIds[0];
   }
   return undefined;
+}
+
+// Returns literal style for WebGL markers
+export async function getWebGLStyle(symbol?: string, opacity?: number): Promise<LiteralStyle> {
+  // style expressions
+  const symbolStyle: LiteralStyle = {
+    symbol: {
+      symbolType: 'circle',
+      size: ['get', 'size', 'number'],
+      color: ['color', ['get', 'red'], ['get', 'green'], ['get', 'blue']],
+      offset: ['array', ['get', 'offsetX'], ['get', 'offsetY']],
+      rotation: ['get', 'rotation', 'number'],
+      opacity: ['get', 'opacity', 'number'],
+    },
+  };
+  // set symbolType and src if a symbol is provided
+  if (symbol && symbolStyle.symbol) {
+    const imageString = 'image';
+    const symbolType = Object.keys(WebGLRegularShapes).find((key) => WebGLRegularShapes[key] === symbol) ?? imageString;
+    symbolStyle.symbol = { ...symbolStyle.symbol, symbolType };
+    if (symbolType === imageString) {
+      const backgroundOpacity = opacity === 0 ? 0 : 0.1 / (opacity ?? 1);
+      symbolStyle.symbol = {
+        ...symbolStyle.symbol,
+        src: await prepareSVG(getPublicOrAbsoluteUrl(symbol), undefined, backgroundOpacity),
+      };
+    }
+  }
+
+  return symbolStyle;
 }
 
 // Will prepare symbols as necessary
@@ -291,6 +379,7 @@ export async function getMarkerMaker(symbol?: string, hasTextLabel?: boolean): P
                   opacity: cfg.opacity ?? 1,
                   scale: (DEFAULT_SIZE + radius) / 100,
                   rotation: (rotation * Math.PI) / 180,
+                  displacement: getDisplacement(cfg.symbolAlign ?? defaultStyleConfig.symbolAlign, radius / 2),
                 }),
                 text: !cfg?.text ? undefined : textLabel(cfg),
               }),
